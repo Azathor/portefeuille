@@ -303,18 +303,22 @@ function LineChart({series, labels, colors, T}){
    → le clavier ne se ferme plus)
 ════════════════════════════════ */
 function AddForm({onSave, onCancel, T}){
-  const rDate=useRef(), rMontant=useRef(), rPrix=useRef(), rParts=useRef();
+  const rDate=useRef(), rMontant=useRef(), rAbond=useRef(), rPrix=useRef(), rParts=useRef();
 
   function save(){
     const date=rDate.current.value;
     const m=toN(rMontant.current.value);
+    const ab=toN(rAbond.current.value);
     const p=toN(rPrix.current.value);
     const pr=toN(rParts.current.value);
     if(!date||isNaN(m)||isNaN(p)){
-      alert("Veuillez renseigner la date, le montant et le prix de la part.");
+      alert("Veuillez renseigner la date, le montant personnel et le prix de la part.");
       return;
     }
-    onSave({date, montant:m, prix:p, parts:isNaN(pr)?+(m/p).toFixed(5):pr});
+    const abondement = isNaN(ab) ? 0 : ab;
+    const totalInvesti = m + abondement;
+    const parts = isNaN(pr) ? +(totalInvesti/p).toFixed(5) : pr;
+    onSave({date, montant:m, abondement, prix:p, parts});
   }
 
   const iS={width:"100%",fontSize:15,padding:"10px 11px",
@@ -324,20 +328,32 @@ function AddForm({onSave, onCancel, T}){
   return(
     <div style={{background:T.formBg,border:"1px solid "+T.cardBdr,borderRadius:12,padding:14,marginBottom:14}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
-        {[
-          ["Date","date","date",rDate,new Date().toISOString().split("T")[0]],
-          ["Montant (€)","text","decimal",rMontant,"ex: 500,00"],
-          ["Prix de la part (€)","text","decimal",rPrix,"ex: 85,67"],
-          ["Parts achetées (opt.)","text","decimal",rParts,"auto si vide"],
-        ].map(([lbl,type,mode,ref,def],i)=>(
-          <div key={i} style={{gridColumn:i===0||i===1?undefined:undefined}}>
-            <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>{lbl}</div>
-            <input ref={ref} type={type} inputMode={mode}
-              placeholder={type==="date"?"":def}
-              defaultValue={type==="date"?def:""}
-              style={iS}/>
-          </div>
-        ))}
+        <div style={{gridColumn:"1/-1"}}>
+          <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>Date</div>
+          <input ref={rDate} type="date"
+            defaultValue={new Date().toISOString().split("T")[0]}
+            style={iS}/>
+        </div>
+        <div>
+          <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>Ma part (€)</div>
+          <input ref={rMontant} type="text" inputMode="decimal" placeholder="ex: 300,00" style={iS}/>
+        </div>
+        <div>
+          <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>Abondement entreprise (€)</div>
+          <input ref={rAbond} type="text" inputMode="decimal" placeholder="ex: 150,00 (opt.)" style={iS}/>
+        </div>
+        <div>
+          <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>Prix de la part (€)</div>
+          <input ref={rPrix} type="text" inputMode="decimal" placeholder="ex: 85,67" style={iS}/>
+        </div>
+        <div>
+          <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>Parts achetées (opt.)</div>
+          <input ref={rParts} type="text" inputMode="decimal" placeholder="auto si vide" style={iS}/>
+        </div>
+      </div>
+      <div style={{fontSize:11,color:T.textSec,marginBottom:10,padding:"8px 10px",
+        background:T.card,borderRadius:8,border:"0.5px solid "+T.cardBdr}}>
+        💡 Les parts achetées sont calculées sur <strong>ma part + abondement</strong>. L'abondement est compté dans les gains.
       </div>
       <div style={{display:"flex",gap:8}}>
         <button onClick={onCancel}
@@ -487,13 +503,21 @@ function App(){
   }
 
   /* ── Calculs ── */
-  const totalCash  = txns.reduce((s,t)=>s+t.montant,0);
-  const totalParts = txns.reduce((s,t)=>s+t.parts,0);
-  const valeur     = totalParts*prix;
-  const gain       = valeur-totalCash;
-  const perf       = totalCash>0?gain/totalCash*100:0;
-  const prixMoyen  = totalParts>0?totalCash/totalParts:0;
-  const gainColor  = gain>=0?T.green:T.red;
+  // montant = ma part perso ; abondement = part entreprise
+  // totalCash = ce que j'ai sorti de ma poche
+  // totalInvesti = ce qui a réellement acheté des parts (perso + abondement)
+  const totalCash       = txns.reduce((s,t)=>s+t.montant,0);
+  const totalAbondement = txns.reduce((s,t)=>s+(t.abondement||0),0);
+  const totalInvesti    = totalCash + totalAbondement;
+  const totalParts      = txns.reduce((s,t)=>s+t.parts,0);
+  const valeur          = totalParts*prix;
+  // Gain = valeur actuelle - ce que j'ai sorti de ma poche (l'abondement est un gain)
+  const gain            = valeur-totalCash;
+  const perf            = totalCash>0?gain/totalCash*100:0;
+  const prixMoyen       = totalParts>0?totalInvesti/totalParts:0;
+  const gainColor       = gain>=0?T.green:T.red;
+  // Gain "pur" hors abondement (plus-value marché seule)
+  const gainSansAbond   = valeur-totalInvesti;
 
   /* ── Données graphique ── */
   const chartData = useCallback(()=>{
@@ -508,7 +532,7 @@ function App(){
     while(d<=now){
       const ds=d.toISOString().split("T")[0];
       let cp=0,cc=0;
-      for(const t of sorted){if(t.date<=ds){cp+=t.parts;cc+=t.montant;}}
+      for(const t of sorted){if(t.date<=ds){cp+=t.parts;cc+=t.montant+(t.abondement||0);}}
       const avgBuy=cp>0?cc/cp:prixMoyen||prix;
       const elapsed=(d-start)/((now-start)||1);
       const simPrix=+(avgBuy+(prix-avgBuy)*elapsed).toFixed(4);
@@ -614,7 +638,7 @@ function App(){
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}>
           {[
             ["Valeur actuelle",   fmtE(valeur),         sgn(gain)+fmt(perf,2)+" %", gain>=0?"#A5D6A7":"#EF9A9A"],
-            ["Cash investi",      fmtE(totalCash),       sgn(gain)+fmtE(gain),       gain>=0?"#A5D6A7":"#EF9A9A"],
+            ["Ma mise de fonds", fmtE(totalCash),       sgn(gain)+fmtE(gain),       gain>=0?"#A5D6A7":"#EF9A9A"],
             ["Total parts",       fmt(totalParts,5),     null,null],
             ["Prix de la part",   fmtE(prix,4),          "modifiable ↓","#90CAF9"],
           ].map(([lbl,val,sub,sc])=>(
@@ -764,20 +788,31 @@ function App(){
       <Card>
         <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:11}}>Résumé</div>
         {[
-          ["Total parts détenues", fmt(totalParts,5),   T.text],
-          ["Prix moyen d'achat",   fmtE(prixMoyen,4),   T.text],
-          ["Prix actuel",          fmtE(prix,4),         T.text],
-          ["Valeur actuelle",      fmtE(valeur),         T.text],
-          ["Cash investi total",   fmtE(totalCash),      T.text],
-          ["Gain / Perte",         sgn(gain)+fmtE(gain), gainColor],
-          ["Performance",          sgn(perf)+fmt(perf,2)+" %", gainColor],
+          ["Total parts détenues",     fmt(totalParts,5),              T.text],
+          ["Prix moyen d'achat",        fmtE(prixMoyen,4),              T.text],
+          ["Prix actuel",               fmtE(prix,4),                   T.text],
+          ["Valeur actuelle",           fmtE(valeur),                   T.text],
+          ["Ma mise de fonds",          fmtE(totalCash),                T.text],
+          ["Abondement reçu",           fmtE(totalAbondement),          "#7B1FA2"],
+          ["Total investi (perso+abond)",fmtE(totalInvesti),            T.text],
+          ["dont plus-value marché",    sgn(gainSansAbond)+fmtE(gainSansAbond), gainSansAbond>=0?T.green:T.red],
+          ["Gain / Perte total",         sgn(gain)+fmtE(gain),          gainColor],
+          ["Performance sur ma mise",    sgn(perf)+fmt(perf,2)+" %",    gainColor],
         ].map(([k,v,c],i)=>(
-          <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",
-            borderBottom:i<6?"0.5px solid "+T.divider:"none",fontSize:13}}>
-            <span style={{color:T.textSec}}>{k}</span>
-            <span style={{fontWeight:600,color:c}}>{v}</span>
+          <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",
+            borderBottom:i<9?"0.5px solid "+T.divider:"none",fontSize:12,
+            background: i===5?"rgba(123,31,162,0.06)":i===8?"rgba(46,125,50,0.06)":"transparent",
+            borderRadius:i===5||i===8?6:0, padding:i===5||i===8?"7px 6px":"7px 0"}}>
+            <span style={{color:i===5?"#7B1FA2":T.textSec,fontWeight:i===5?600:400}}>{k}</span>
+            <span style={{fontWeight:700,color:c}}>{v}</span>
           </div>
         ))}
+        {totalAbondement>0&&(
+          <div style={{marginTop:8,padding:"6px 10px",background:"rgba(123,31,162,0.08)",
+            borderRadius:8,fontSize:11,color:"#7B1FA2",textAlign:"center"}}>
+            🎁 L'abondement de {fmtE(totalAbondement)} est inclus dans votre gain total
+          </div>
+        )}
       </Card>
 
       {/* ════ TRANSACTIONS ════ */}
@@ -813,7 +848,9 @@ function App(){
                     <span style={{background:T.badgeBg,color:T.badgeTxt,borderRadius:5,
                       padding:"1px 7px",fontSize:10,fontWeight:700}}>Achat</span>
                   </div>
-                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{fmtE(t.montant)}</div>
+                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{fmtE(t.montant)}
+                    {(t.abondement>0)&&<span style={{fontSize:11,color:"#7B1FA2",fontWeight:600,marginLeft:6}}>+{fmtE(t.abondement)} 🎁</span>}
+                  </div>
                   <div style={{fontSize:11,color:T.textSec}}>{fmt(t.parts,5)} parts · {fmtE(t.prix,4)}/part</div>
                 </div>
                 <div style={{textAlign:"right",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
