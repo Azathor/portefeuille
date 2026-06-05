@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="Portefeuille"/>
+  <meta name="theme-color" content="#1565C0"/>
+  <title>Mon Portefeuille – Amundi</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+    html,body{height:100%;background:#F4F6FA;font-family:system-ui,-apple-system,sans-serif}
+    input,button{font-family:inherit;font-size:16px}
+    input[type=text],input[type=number],input[type=date]{font-size:16px!important}
+    ::-webkit-scrollbar{display:none}
+    #root{min-height:100vh}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React + Babel + SheetJS (lecture fichier Excel Amundi) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script>window.addEventListener("DOMContentLoaded",()=>{if(typeof Babel==="undefined"){document.getElementById("root").innerHTML='<div style="padding:20px;color:red">Erreur de chargement. Vérifiez votre connexion internet.</div>'}});</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+<script type="text/babel" data-presets="react" data-plugins="">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ── Clés de stockage ── */
+const TXNS_KEY  = "amundi_txns_v1";
+const PRIX_KEY  = "amundi_prix_v1";
+const THEME_KEY = "amundi_theme_v1";
+const NAV_KEY   = "amundi_nav_history_v1";
+
+/* Convertit un numéro de série Excel en date ISO "YYYY-MM-DD" */
+function excelDateToISO(serial){
+  const d = new Date(Math.round((serial - 25569)*86400*1000));
+  return d.toISOString().split("T")[0];
+}
+
+/* ── Utilitaires ── */
+const fmt  = (n,d=2) => new Intl.NumberFormat("fr-FR",{minimumFractionDigits:d,maximumFractionDigits:d}).format(n);
+const fmtE = (n,d=2) => fmt(n,d)+" €";
+const sgn  = (n) => n>=0?"+":"";
+const toN  = (s) => parseFloat(String(s||"").replace(",","."));
+
+/* ── Données par défaut ── */
+const DEFAULT_TXNS = []; // Aucune transaction par défaut
+
+/* ── Thèmes ── */
+const LIGHT = {
+  bg:"#F4F6FA", card:"#FFFFFF", cardBdr:"#E0E4EE",
+  header:"#1565C0", headerSub:"#90CAF9", kpiBg:"rgba(255,255,255,0.15)",
+  text:"#1A1A2E", textSec:"#5A6A85", textTer:"#9BA8BE",
+  inputBg:"#FFFFFF", inputBdr:"#C5CCE0", formBg:"#EEF1FA",
+  btnBg:"#1565C0", btnTxt:"#FFFFFF",
+  periodAct:"#1565C0", periodTxt:"#5A6A85", periodBdr:"#C5CCE0",
+  badgeBg:"#E3F2FD", badgeTxt:"#0C447C",
+  green:"#1B5E20", red:"#B71C1C", divider:"#E0E4EE", lockTxt:"#9BA8BE",
+  chartGrid:"#E8ECF5", chartTick:"#8896B0",
+  c1:"#1565C0", c2:"#2E7D32", c3:"#7B1FA2",
+};
+const DARK = {
+  bg:"#0D1117", card:"#161B22", cardBdr:"#2A3140",
+  header:"#0D47A1", headerSub:"#64B5F6", kpiBg:"rgba(255,255,255,0.08)",
+  text:"#E6EDF3", textSec:"#8B949E", textTer:"#484F58",
+  inputBg:"#0D1117", inputBdr:"#30363D", formBg:"#0D1117",
+  btnBg:"#1976D2", btnTxt:"#FFFFFF",
+  periodAct:"#1976D2", periodTxt:"#8B949E", periodBdr:"#30363D",
+  badgeBg:"#0C2D48", badgeTxt:"#64B5F6",
+  green:"#3FB950", red:"#F85149", divider:"#2A3140", lockTxt:"#484F58",
+  chartGrid:"#21262D", chartTick:"#8B949E",
+  c1:"#58A6FF", c2:"#3FB950", c3:"#BC8CFF",
+};
+
+/* ── Stockage localStorage ── */
+function lsGet(key, fallback=null){
+  try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch{ return fallback; }
+}
+function lsSet(key, val){
+  try{ localStorage.setItem(key, JSON.stringify(val)); }catch{}
+}
+
+/* ════════════════════════════════
+   GRAPHIQUE COURS ACTION (mono-ligne + remplissage)
+════════════════════════════════ */
+function ActionChart({vals, labels, T, positive}){
+  const W=340, H=170, PL=46, PR=10, PT=12, PB=30;
+  const iW=W-PL-PR, iH=H-PT-PB;
+  const [tip, setTip] = useState(null);
+  const svgRef = useRef(null);
+  if(!vals||!vals.length)return null;
+
+  const minV=Math.min(...vals), maxV=Math.max(...vals);
+  const pad=(maxV-minV)*0.12||1;
+  const mn=minV-pad, mx=maxV+pad;
+
+  const xOf=i=>PL+(i/(vals.length-1||1))*iW;
+  const yOf=v=>PT+iH-((v-mn)/(mx-mn||1))*iH;
+
+  const path=vals.map((v,i)=>`${i===0?"M":"L"}${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`).join(" ");
+  const area=path+` L${xOf(vals.length-1).toFixed(1)},${PT+iH} L${xOf(0).toFixed(1)},${PT+iH} Z`;
+
+  const color=positive?T.c2:T.red;
+  const ticks=Array.from({length:5},(_,i)=>mn+(mx-mn)*i/4);
+  const xIdx=vals.length<=6?vals.map((_,i)=>i)
+    :[0,Math.round((vals.length-1)/4),Math.round((vals.length-1)/2),Math.round(3*(vals.length-1)/4),vals.length-1];
+
+  function updateTip(clientX){
+    if(!svgRef.current)return;
+    const rect=svgRef.current.getBoundingClientRect();
+    const mx2=(clientX-rect.left)*(W/rect.width)-PL;
+    const idx=Math.max(0,Math.min(vals.length-1,Math.round(mx2/iW*(vals.length-1))));
+    setTip({idx,x:xOf(idx),v:vals[idx]});
+  }
+
+  return(
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`}
+      style={{width:"100%",height:"auto",display:"block",cursor:"crosshair",touchAction:"none"}}
+      onMouseMove={e=>updateTip(e.clientX)} onMouseLeave={()=>setTip(null)}
+      onTouchMove={e=>{e.preventDefault();updateTip(e.touches[0].clientX);}} onTouchEnd={()=>setTip(null)}>
+
+      <defs>
+        <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.25"/>
+          <stop offset="100%" stopColor={color} stopOpacity="0.02"/>
+        </linearGradient>
+      </defs>
+
+      {/* Grille */}
+      {ticks.map((v,i)=>(
+        <line key={i} x1={PL} y1={yOf(v)} x2={W-PR} y2={yOf(v)} stroke={T.chartGrid} strokeWidth="0.8"/>
+      ))}
+      {/* Ticks Y */}
+      {ticks.map((v,i)=>(
+        <text key={i} x={PL-5} y={yOf(v)+4} textAnchor="end" fontSize="7.5" fill={T.chartTick}>
+          {fmt(v,2)}
+        </text>
+      ))}
+      {/* Labels X */}
+      {xIdx.map(i=>(
+        <text key={i} x={xOf(i)} y={H-4} textAnchor="middle" fontSize="7.5" fill={T.chartTick}>
+          {labels[i]}
+        </text>
+      ))}
+
+      {/* Zone remplie */}
+      <path d={area} fill="url(#areaGrad)"/>
+      {/* Ligne */}
+      <path d={path} fill="none" stroke={color} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round"/>
+
+      {/* Dernier point */}
+      <circle cx={xOf(vals.length-1)} cy={yOf(vals[vals.length-1])} r="4" fill={color} stroke={T.card} strokeWidth="2"/>
+
+      {/* Tooltip */}
+      {tip&&(<>
+        <line x1={tip.x} y1={PT} x2={tip.x} y2={PT+iH} stroke={T.chartTick} strokeWidth="1" strokeDasharray="3,2"/>
+        <circle cx={tip.x} cy={yOf(tip.v)} r="4" fill={color} stroke={T.card} strokeWidth="2"/>
+        {(()=>{
+          const bw=88,bh=30;
+          const bx=tip.x+8+bw>W-PR?tip.x-bw-8:tip.x+8;
+          const by=Math.max(PT,Math.min(PT+iH-bh,yOf(tip.v)-bh/2));
+          return(
+            <g>
+              <rect x={bx} y={by} width={bw} height={bh} rx="5" fill={T.card} stroke={T.cardBdr} strokeWidth="1" opacity="0.97"/>
+              <text x={bx+7} y={by+11} fontSize="7.5" fill={T.textSec}>{labels[tip.idx]}</text>
+              <text x={bx+7} y={by+23} fontSize="8.5" fill={color} fontWeight="700">{fmtE(tip.v,4)}</text>
+            </g>
+          );
+        })()}
+      </>)}
+    </svg>
+  );
+}
+
+/* ════════════════════════════════
+   GRAPHIQUE SVG NATIF
+════════════════════════════════ */
+function LineChart({series, labels, colors, T}){
+  const W=340, H=170, PL=46, PR=46, PT=12, PB=30;
+  const iW=W-PL-PR, iH=H-PT-PB;
+  const [tip, setTip] = useState(null);
+  const svgRef = useRef(null);
+
+  if(!labels||!labels.length) return(
+    <div style={{height:H,display:"flex",alignItems:"center",justifyContent:"center",color:T.textTer,fontSize:13}}>
+      Ajoutez des transactions pour voir le graphique
+    </div>
+  );
+
+  const leftData  = series.filter(s=>s.axis==="L").flatMap(s=>s.data);
+  const rightData = series.filter(s=>s.axis==="R").flatMap(s=>s.data);
+  const minL=Math.min(...leftData), maxL=Math.max(...leftData);
+  const minR=Math.min(...rightData),maxR=Math.max(...rightData);
+  const padL=(maxL-minL)*0.08||50, padR=(maxR-minR)*0.08||2;
+
+  const xOf = i => PL+(i/(labels.length-1||1))*iW;
+  const yOf = (v,ax) => {
+    const [mn,mx]=ax==="L"?[minL-padL,maxL+padL]:[minR-padR,maxR+padR];
+    return PT+iH-((v-mn)/(mx-mn||1))*iH;
+  };
+  const pathOf = (data,ax) =>
+    data.map((v,i)=>`${i===0?"M":"L"}${xOf(i).toFixed(1)},${yOf(v,ax).toFixed(1)}`).join(" ");
+  const areaOf = (data,ax) => {
+    const base=PT+iH;
+    return pathOf(data,ax)+` L${xOf(data.length-1).toFixed(1)},${base} L${xOf(0).toFixed(1)},${base} Z`;
+  };
+
+  const mkTicks=(mn,mx,pad,n=4)=>Array.from({length:n+1},(_,i)=>(mn-pad)+(mx-mn+2*pad)*i/n);
+  const ticksL=mkTicks(minL,maxL,padL);
+  const ticksR=mkTicks(minR,maxR,padR);
+  const xIdx=labels.length<=6
+    ?labels.map((_,i)=>i)
+    :[0,Math.round((labels.length-1)/4),Math.round((labels.length-1)/2),Math.round(3*(labels.length-1)/4),labels.length-1];
+
+  function updateTip(clientX){
+    if(!svgRef.current)return;
+    const rect=svgRef.current.getBoundingClientRect();
+    const mx=(clientX-rect.left)*(W/rect.width)-PL;
+    const idx=Math.max(0,Math.min(labels.length-1,Math.round(mx/iW*(labels.length-1))));
+    setTip({idx, x:xOf(idx), vals:series.map(s=>s.data[idx])});
+  }
+
+  return(
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`}
+      style={{width:"100%",height:"auto",display:"block",cursor:"crosshair",touchAction:"none"}}
+      onMouseMove={e=>updateTip(e.clientX)} onMouseLeave={()=>setTip(null)}
+      onTouchMove={e=>{e.preventDefault();updateTip(e.touches[0].clientX);}} onTouchEnd={()=>setTip(null)}>
+
+      {/* Grille horizontale */}
+      {ticksL.map((v,i)=>(
+        <line key={i} x1={PL} y1={yOf(v,"L")} x2={W-PR} y2={yOf(v,"L")} stroke={T.chartGrid} strokeWidth="0.8"/>
+      ))}
+      {/* Ticks axe gauche (€ portefeuille) */}
+      {ticksL.map((v,i)=>(
+        <text key={i} x={PL-5} y={yOf(v,"L")+4} textAnchor="end" fontSize="7.5" fill={T.chartTick}>
+          {fmt(v,0)}
+        </text>
+      ))}
+      {/* Ticks axe droit (€ part) */}
+      {ticksR.map((v,i)=>(
+        <text key={i} x={W-PR+5} y={yOf(v,"R")+4} textAnchor="start" fontSize="7.5" fill={colors[2]}>
+          {fmt(v,2)}
+        </text>
+      ))}
+      {/* Labels X */}
+      {xIdx.map(i=>(
+        <text key={i} x={xOf(i)} y={H-4} textAnchor="middle" fontSize="7.5" fill={T.chartTick}>
+          {labels[i]}
+        </text>
+      ))}
+
+      {/* Zone remplie cash */}
+      <path d={areaOf(series[0].data,"L")} fill={colors[0]} opacity="0.10"/>
+
+      {/* Lignes */}
+      {series.map((s,si)=>(
+        <path key={si} d={pathOf(s.data,s.axis)} fill="none" stroke={colors[si]}
+          strokeWidth={si===2?1.5:2.2} strokeDasharray={si===2?"5,3":undefined}
+          strokeLinejoin="round" strokeLinecap="round"/>
+      ))}
+
+      {/* Ligne verticale tooltip */}
+      {tip&&<line x1={tip.x} y1={PT} x2={tip.x} y2={PT+iH} stroke={T.chartTick} strokeWidth="1" strokeDasharray="3,2"/>}
+
+      {/* Points tooltip */}
+      {tip&&series.map((s,si)=>(
+        <circle key={si} cx={tip.x} cy={yOf(s.data[tip.idx],s.axis)} r="4"
+          fill={colors[si]} stroke={T.card} strokeWidth="2"/>
+      ))}
+
+      {/* Boîte tooltip */}
+      {tip&&(()=>{
+        const bw=118, bh=series.length*17+14;
+        const bx=tip.x+10+bw>W-PR?tip.x-bw-10:tip.x+10;
+        const by=Math.max(PT,Math.min(PT+iH-bh,yOf(tip.vals[0],"L")-bh/2));
+        return(
+          <g>
+            <rect x={bx} y={by} width={bw} height={bh} rx="6"
+              fill={T.card} stroke={T.cardBdr} strokeWidth="1" opacity="0.97"/>
+            <text x={bx+7} y={by+12} fontSize="8" fill={T.textSec} fontWeight="600">{labels[tip.idx]}</text>
+            {series.map((s,si)=>(
+              <g key={si}>
+                <rect x={bx+7} y={by+19+si*17} width="8" height="3" rx="1" fill={colors[si]}/>
+                <text x={bx+19} y={by+24+si*17} fontSize="7.5" fill={T.text}>
+                  {s.label}: {s.axis==="L"?fmtE(tip.vals[si]):fmt(tip.vals[si],4)+" €"}
+                </text>
+              </g>
+            ))}
+          </g>
+        );
+      })()}
+    </svg>
+  );
+}
+
+/* ════════════════════════════════
+   FORMULAIRE (inputs non-contrôlés
+   → le clavier ne se ferme plus)
+════════════════════════════════ */
+function AddForm({onSave, onCancel, T}){
+  const rDate=useRef(), rMontant=useRef(), rPrix=useRef(), rParts=useRef();
+
+  function save(){
+    const date=rDate.current.value;
+    const m=toN(rMontant.current.value);
+    const p=toN(rPrix.current.value);
+    const pr=toN(rParts.current.value);
+    if(!date||isNaN(m)||isNaN(p)){
+      alert("Veuillez renseigner la date, le montant et le prix de la part.");
+      return;
+    }
+    onSave({date, montant:m, prix:p, parts:isNaN(pr)?+(m/p).toFixed(5):pr});
+  }
+
+  const iS={width:"100%",fontSize:15,padding:"10px 11px",
+    border:"1px solid "+T.inputBdr,borderRadius:9,
+    background:T.inputBg,color:T.text,outline:"none",WebkitAppearance:"none"};
+
+  return(
+    <div style={{background:T.formBg,border:"1px solid "+T.cardBdr,borderRadius:12,padding:14,marginBottom:14}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+        {[
+          ["Date","date","date",rDate,new Date().toISOString().split("T")[0]],
+          ["Montant (€)","text","decimal",rMontant,"ex: 500,00"],
+          ["Prix de la part (€)","text","decimal",rPrix,"ex: 85,67"],
+          ["Parts achetées (opt.)","text","decimal",rParts,"auto si vide"],
+        ].map(([lbl,type,mode,ref,def],i)=>(
+          <div key={i} style={{gridColumn:i===0||i===1?undefined:undefined}}>
+            <div style={{fontSize:11,color:T.textSec,marginBottom:5,fontWeight:500}}>{lbl}</div>
+            <input ref={ref} type={type} inputMode={mode}
+              placeholder={type==="date"?"":def}
+              defaultValue={type==="date"?def:""}
+              style={iS}/>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={onCancel}
+          style={{flex:1,padding:"10px 0",background:"transparent",color:T.textSec,
+            border:"1px solid "+T.cardBdr,borderRadius:10,fontSize:14,cursor:"pointer"}}>
+          Annuler
+        </button>
+        <button onClick={save}
+          style={{flex:2,padding:"10px 0",background:T.btnBg,color:T.btnTxt,
+            border:"none",borderRadius:10,fontSize:14,fontWeight:600,cursor:"pointer"}}>
+          ✓ Enregistrer
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════════════════
+   APPLICATION PRINCIPALE
+════════════════════════════════ */
+function App(){
+  const [txns,     setTxns]     = useState([]);
+  const [prix,     setPrix]     = useState(85.67);
+  const [prixInp,  setPrixInp]  = useState("85,6700");
+  const prixRef = useRef(null);
+  const [period,   setPeriod]   = useState("1M");
+  const [chartView,setChartView]= useState("portefeuille"); // "portefeuille" | "action"
+  const [actionPeriod,setActionPeriod]=useState("1J");
+  const [showForm, setShowForm] = useState(false);
+  const [saved,    setSaved]    = useState(false);
+  const [loading,  setLoading]  = useState(true);
+  const [dark,     setDark]     = useState(false);
+  const [navHistory,setNavHistory]= useState([]); // [{date:"YYYY-MM-DD", nav:85.67}, ...]
+  const [navImporting,setNavImporting]=useState(false);
+  const [navMsg,   setNavMsg]    = useState("");
+
+  const T = dark?DARK:LIGHT;
+
+  /* ── Chargement initial ── */
+  useEffect(()=>{
+    const t  = lsGet(TXNS_KEY);
+    const p  = lsGet(PRIX_KEY);
+    const th = lsGet(THEME_KEY);
+    const nav= lsGet(NAV_KEY);
+    setTxns(t||[]);
+    if(p!==null){ setPrix(p); setPrixInp(String(p).replace(".",",")); }
+    if(th!==null) setDark(th);
+    else setDark(window.matchMedia&&window.matchMedia("(prefers-color-scheme:dark)").matches);
+    if(nav&&nav.length) setNavHistory(nav);
+    setLoading(false);
+  },[]);
+
+  /* ── Actions ── */
+  function toggleTheme(){ const n=!dark; setDark(n); lsSet(THEME_KEY,n); }
+
+  function saveTxns(data){ setTxns(data); lsSet(TXNS_KEY,data); }
+
+  function handleSavePrix(){
+    const raw = prixRef.current ? prixRef.current.value : prixInp;
+    const v=toN(raw);
+    if(isNaN(v)||v<=0)return;
+    setPrix(v); lsSet(PRIX_KEY,v);
+    setSaved(true); setTimeout(()=>setSaved(false),2000);
+  }
+
+  function addTxn(data){
+    const next=[...txns,{id:Date.now(),...data}].sort((a,b)=>a.date.localeCompare(b.date));
+    saveTxns(next); setShowForm(false);
+  }
+
+  function delTxn(id){ if(confirm("Supprimer cette transaction ?")) saveTxns(txns.filter(t=>t.id!==id)); }
+
+  /* ── Export JSON ── */
+  function exportData(){
+    const blob=new Blob([JSON.stringify({transactions:txns,prixActuel:prix},null,2)],{type:"application/json"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download="portefeuille_amundi_"+new Date().toISOString().split("T")[0]+".json"; a.click();
+  }
+
+  /* ── Import JSON ── */
+  function importData(e){
+    const file=e.target.files[0]; if(!file)return;
+    const r=new FileReader();
+    r.onload=ev=>{
+      try{
+        const d=JSON.parse(ev.target.result);
+        if(d.transactions){ saveTxns(d.transactions); alert("✓ "+d.transactions.length+" transactions importées !"); }
+        if(d.prixActuel){ setPrix(d.prixActuel); lsSet(PRIX_KEY,d.prixActuel); }
+      }catch{ alert("Fichier JSON invalide."); }
+    };
+    r.readAsText(file);
+    e.target.value="";
+  }
+
+  /* ── Import fichier Excel Amundi (Export NAV) ── */
+  function importAmundiXLSX(e){
+    const file=e.target.files[0]; if(!file)return;
+    setNavImporting(true); setNavMsg("");
+    const reader=new FileReader();
+    reader.onload=ev=>{
+      try{
+        const wb=XLSX.read(ev.target.result,{type:"array"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        // Lecture brute avec SheetJS — format Amundi : col B=date, col D=NAV, header ligne 9 (index 8)
+        const rows=XLSX.utils.sheet_to_json(ws,{header:1,defval:null,raw:true});
+        const navData=[];
+        for(let i=0;i<rows.length;i++){
+          const row=rows[i]; if(!row) continue;
+          // La date est en colonne B (index 1), NAV en colonne D (index 3)
+          const rawDate=row[1], rawNav=row[3];
+          if(rawDate===null||rawDate===undefined||rawDate==="Date") continue;
+          const nav=parseFloat(rawNav);
+          if(isNaN(nav)||nav<=0) continue;
+          let dateStr="";
+          if(typeof rawDate==="number"&&rawDate>40000){
+            // Numéro de série Excel
+            dateStr=excelDateToISO(rawDate);
+          } else if(rawDate instanceof Date||String(rawDate).match(/\d{4}-\d{2}-\d{2}/)){
+            // Date JS ou ISO
+            const d=new Date(rawDate);
+            dateStr=d.toISOString().split("T")[0];
+          } else if(typeof rawDate==="string"&&rawDate.includes("/")){
+            // Format DD/MM/YYYY
+            const parts=rawDate.split("/");
+            if(parts.length===3){
+              const [dd,mm,yyyy]=parts;
+              dateStr=`${yyyy}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}`;
+            }
+          }
+          if(dateStr&&dateStr.match(/^\d{4}-\d{2}-\d{2}$/)) navData.push({date:dateStr,nav});
+        }
+        if(!navData.length) throw new Error("Aucune donnée NAV trouvée — vérifiez que c'est bien le fichier Export NAV d'Amundi EE.");
+        navData.sort((a,b)=>a.date.localeCompare(b.date));
+        setNavHistory(navData);
+        lsSet(NAV_KEY, navData);
+        // Met à jour le prix actuel avec la dernière VL
+        const last=navData[navData.length-1];
+        if(last){ setPrix(last.nav); setPrixInp(String(last.nav).replace(".",",")); lsSet(PRIX_KEY,last.nav); }
+        setNavMsg("✓ "+navData.length+" valeurs liquidatives importées ("+navData[0].date+" → "+last.date+")");
+      }catch(err){
+        setNavMsg("❌ Erreur : "+err.message);
+      }
+      setNavImporting(false);
+    };
+    reader.readAsArrayBuffer(file);
+    e.target.value="";
+  }
+
+  /* ── Calculs ── */
+  const totalCash  = txns.reduce((s,t)=>s+t.montant,0);
+  const totalParts = txns.reduce((s,t)=>s+t.parts,0);
+  const valeur     = totalParts*prix;
+  const gain       = valeur-totalCash;
+  const perf       = totalCash>0?gain/totalCash*100:0;
+  const prixMoyen  = totalParts>0?totalCash/totalParts:0;
+  const gainColor  = gain>=0?T.green:T.red;
+
+  /* ── Données graphique ── */
+  const chartData = useCallback(()=>{
+    if(!txns.length)return null;
+    const now=new Date();
+    const days={"7J":7,"1M":30,"3M":90,"1A":365,"TOUT":3650}[period]||30;
+    const sorted=[...txns].sort((a,b)=>a.date.localeCompare(b.date));
+    const fromD=new Date(now); fromD.setDate(fromD.getDate()-days);
+    const start=new Date(sorted[0].date)>fromD?new Date(sorted[0].date):fromD;
+    const step=days<=30?1:days<=90?3:7;
+    const pts=[]; const d=new Date(start);
+    while(d<=now){
+      const ds=d.toISOString().split("T")[0];
+      let cp=0,cc=0;
+      for(const t of sorted){if(t.date<=ds){cp+=t.parts;cc+=t.montant;}}
+      const avgBuy=cp>0?cc/cp:prixMoyen||prix;
+      const elapsed=(d-start)/((now-start)||1);
+      const simPrix=+(avgBuy+(prix-avgBuy)*elapsed).toFixed(4);
+      pts.push({ds, cash:+cc.toFixed(2), portef:+(cp*simPrix).toFixed(2), part:simPrix});
+      d.setDate(d.getDate()+step);
+    }
+    if(pts.length){
+      pts[pts.length-1].portef=+(totalParts*prix).toFixed(2);
+      pts[pts.length-1].part=prix;
+    }
+    const lf=days<=90?{day:"2-digit",month:"2-digit"}:{month:"short",year:"2-digit"};
+    return{
+      labels:pts.map(p=>new Date(p.ds).toLocaleDateString("fr-FR",lf)),
+      cash:pts.map(p=>p.cash), portef:pts.map(p=>p.portef), part:pts.map(p=>p.part),
+    };
+  },[txns,period,prix,prixMoyen,totalParts]);
+
+  const cd=chartData();
+
+  /* ── Données graphique cours de l'action (vraies VL si importées) ── */
+  const actionData = useCallback(()=>{
+    const now=new Date();
+    const cutDays={"4H":1,"1J":1,"1S":7,"1M":30,"1A":365}[actionPeriod]||30;
+    const lf=cutDays<=1?{hour:"2-digit",minute:"2-digit"}:cutDays<=7?{day:"2-digit",month:"2-digit"}:cutDays<=30?{day:"2-digit",month:"2-digit"}:{month:"short",year:"2-digit"};
+
+    // ── Données réelles importées ──
+    if(navHistory&&navHistory.length>0){
+      const cutDate=new Date(now); cutDate.setDate(cutDate.getDate()-cutDays);
+      let filtered=navHistory.filter(p=>new Date(p.date)>=cutDate);
+      // Pour 4H et 1J : on n'a qu'une VL/jour → on prend les 2 derniers jours
+      if(cutDays<=1) filtered=navHistory.slice(-2);
+      if(!filtered.length) filtered=navHistory.slice(-Math.min(30,navHistory.length));
+      const vals=filtered.map(p=>p.nav);
+      const labels=filtered.map(p=>{
+        const d=new Date(p.date);
+        return cutDays<=1?d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"}):d.toLocaleDateString("fr-FR",lf);
+      });
+      const startV=vals[0], endV=vals[vals.length-1];
+      const diff=endV-startV, diffPct=startV>0?diff/startV*100:0;
+      return {labels, vals, diff, diffPct, startV, endV, real:true};
+    }
+
+    // ── Fallback simulé si pas encore de données importées ──
+    const seed=prix*137.5+cutDays*7.3;
+    const nPts=Math.min(60,cutDays<=1?2:cutDays<=7?7:cutDays<=30?30:52);
+    function seededRnd(i){ let x=Math.sin(seed+i)*10000; return x-Math.floor(x); }
+    const rawPts=[]; let v=prix;
+    for(let i=nPts;i>=0;i--){
+      const noise=cutDays<=1?0.05:cutDays<=7?0.30:cutDays<=30?0.70:3.0;
+      v=Math.max(prix*0.7,Math.min(prix*1.3,v+(seededRnd(i)*2-1)*noise));
+      const d=new Date(now); d.setDate(d.getDate()-i*(cutDays/nPts));
+      rawPts.push({v:+v.toFixed(4), label:d.toLocaleDateString("fr-FR",lf)});
+    }
+    rawPts[rawPts.length-1].v=prix;
+    const startV=rawPts[0].v, endV=prix;
+    return {labels:rawPts.map(p=>p.label), vals:rawPts.map(p=>p.v),
+      diff:endV-startV, diffPct:startV>0?(endV-startV)/startV*100:0, startV, endV, real:false};
+  },[actionPeriod,prix,navHistory]);
+
+  const ad=actionData();
+
+  /* ── Composant carte ── */
+  const Card=({children,mb=10})=>(
+    <div style={{background:T.card,border:"0.5px solid "+T.cardBdr,borderRadius:16,padding:16,marginBottom:mb}}>
+      {children}
+    </div>
+  );
+
+  if(loading)return(
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",
+      minHeight:"100vh",background:T.bg,color:T.textSec,fontSize:15}}>
+      Chargement…
+    </div>
+  );
+
+  return(
+    <div style={{background:T.bg,minHeight:"100vh",padding:"12px 12px 40px"}}>
+    <div style={{maxWidth:430,margin:"0 auto"}}>
+
+      {/* ════ HEADER ════ */}
+      <div style={{background:T.header,borderRadius:18,padding:16,marginBottom:12}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:40,height:40,background:"rgba(255,255,255,0.15)",borderRadius:12,
+              display:"flex",alignItems:"center",justifyContent:"center",fontSize:22}}>📊</div>
+            <div>
+              <div style={{fontSize:16,fontWeight:700,color:"#fff"}}>Mon Portefeuille</div>
+              <div style={{fontSize:10,color:T.headerSub}}>Amundi Actions Monde · QS0009098367</div>
+            </div>
+          </div>
+          {/* Toggle thème */}
+          <button onClick={toggleTheme}
+            style={{background:"rgba(255,255,255,0.15)",border:"none",borderRadius:20,
+              width:54,height:30,cursor:"pointer",position:"relative"}}>
+            <span style={{position:"absolute",left:dark?28:4,top:5,width:20,height:20,
+              borderRadius:"50%",background:dark?"#F0A500":"#fff",
+              transition:"left .25s",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12}}>
+              {dark?"☀️":"🌙"}
+            </span>
+          </button>
+        </div>
+        {/* KPIs */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:9}}>
+          {[
+            ["Valeur actuelle",   fmtE(valeur),         sgn(gain)+fmt(perf,2)+" %", gain>=0?"#A5D6A7":"#EF9A9A"],
+            ["Cash investi",      fmtE(totalCash),       sgn(gain)+fmtE(gain),       gain>=0?"#A5D6A7":"#EF9A9A"],
+            ["Total parts",       fmt(totalParts,5),     null,null],
+            ["Prix de la part",   fmtE(prix,4),          "modifiable ↓","#90CAF9"],
+          ].map(([lbl,val,sub,sc])=>(
+            <div key={lbl} style={{background:T.kpiBg,borderRadius:11,padding:"11px 13px"}}>
+              <div style={{fontSize:10,color:T.headerSub,marginBottom:3}}>{lbl}</div>
+              <div style={{fontSize:16,fontWeight:700,color:"#fff"}}>{val}</div>
+              {sub&&<div style={{fontSize:10,color:sc||"#A5D6A7",marginTop:2}}>{sub}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ════ PRIX ════ */}
+      <Card>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <span style={{fontSize:12,color:T.textSec,whiteSpace:"nowrap"}}>Prix actuel (€)</span>
+          <input ref={prixRef} type="text" inputMode="decimal"
+            defaultValue={prixInp}
+            placeholder="ex: 85,6700"
+            style={{flex:1,fontSize:14,padding:"8px 11px",border:"1px solid "+T.inputBdr,
+              borderRadius:9,background:T.inputBg,color:T.text,outline:"none"}}/>
+          <button onClick={handleSavePrix}
+            style={{padding:"8px 14px",background:T.btnBg,color:T.btnTxt,border:"none",
+              borderRadius:9,fontSize:13,cursor:"pointer",fontWeight:600,whiteSpace:"nowrap"}}>
+            Mettre à jour
+          </button>
+          {saved&&<span style={{fontSize:14,color:T.green}}>✓</span>}
+        </div>
+      </Card>
+
+      {/* ════ GRAPHIQUES ════ */}
+      <Card>
+        {/* Sélecteur de vue */}
+        <div style={{display:"flex",background:T.formBg,borderRadius:10,padding:3,marginBottom:14,gap:3}}>
+          {[["portefeuille","📈 Portefeuille"],["action","📊 Cours action"]].map(([v,lbl])=>(
+            <button key={v} onClick={()=>setChartView(v)}
+              style={{flex:1,padding:"7px 4px",border:"none",borderRadius:8,fontSize:12,fontWeight:700,
+                cursor:"pointer",transition:"all .2s",
+                background:chartView===v?T.btnBg:"transparent",
+                color:chartView===v?"#fff":T.textSec}}>
+              {lbl}
+            </button>
+          ))}
+        </div>
+
+        {/* ── Vue Portefeuille ── */}
+        {chartView==="portefeuille"&&(<>
+          <div style={{fontSize:13,fontWeight:700,color:T.text,marginBottom:10}}>Évolution du portefeuille</div>
+          <div style={{display:"flex",gap:5,marginBottom:11,flexWrap:"wrap"}}>
+            {["7J","1M","3M","1A","TOUT"].map(p=>(
+              <button key={p} onClick={()=>setPeriod(p)}
+                style={{padding:"5px 11px",border:"1px solid "+(period===p?T.periodAct:T.periodBdr),
+                  borderRadius:9,fontSize:12,cursor:"pointer",fontWeight:period===p?700:400,
+                  background:period===p?T.periodAct:"transparent",
+                  color:period===p?"#fff":T.periodTxt,transition:"all .15s"}}>
+                {p}
+              </button>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:14,marginBottom:10,flexWrap:"wrap"}}>
+            {[[T.c1,"Cash investi"],[T.c2,"Valeur portef."],[T.c3,"Prix part"]].map(([c,l])=>(
+              <span key={l} style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:T.textSec}}>
+                <span style={{width:16,height:3,background:c,borderRadius:2,display:"inline-block"}}/>
+                {l}
+              </span>
+            ))}
+          </div>
+          {cd?(
+            <LineChart
+              labels={cd.labels}
+              series={[
+                {label:"Cash investi",  data:cd.cash,   axis:"L"},
+                {label:"Valeur portef.",data:cd.portef, axis:"L"},
+                {label:"Prix part",     data:cd.part,   axis:"R"},
+              ]}
+              colors={[T.c1,T.c2,T.c3]} T={T}/>
+          ):(
+            <div style={{height:160,display:"flex",alignItems:"center",justifyContent:"center",color:T.textTer,fontSize:13}}>
+              Ajoutez une transaction pour voir le graphique
+            </div>
+          )}
+        </>)}
+
+        {/* ── Vue Cours action ── */}
+        {chartView==="action"&&(<>
+          {/* Titre + variation */}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+            <div>
+              <div style={{fontSize:13,fontWeight:700,color:T.text}}>Amundi Actions Monde</div>
+              <div style={{fontSize:11,color:T.textSec}}>QS0009098367 · Prix simulé</div>
+            </div>
+            <div style={{textAlign:"right"}}>
+              <div style={{fontSize:18,fontWeight:700,color:T.text}}>{fmtE(prix,4)}</div>
+              <div style={{fontSize:12,fontWeight:600,color:ad.diff>=0?T.green:T.red}}>
+                {sgn(ad.diff)}{fmt(ad.diff,4)} € ({sgn(ad.diffPct)}{fmt(ad.diffPct,2)} %)
+              </div>
+            </div>
+          </div>
+          {/* Filtres période action */}
+          <div style={{display:"flex",gap:5,marginBottom:12}}>
+            {["4H","1J","1S","1M","1A"].map(p=>(
+              <button key={p} onClick={()=>setActionPeriod(p)}
+                style={{flex:1,padding:"6px 0",border:"1px solid "+(actionPeriod===p?T.periodAct:T.periodBdr),
+                  borderRadius:9,fontSize:12,cursor:"pointer",fontWeight:actionPeriod===p?700:400,
+                  background:actionPeriod===p?T.periodAct:"transparent",
+                  color:actionPeriod===p?"#fff":T.periodTxt,transition:"all .15s"}}>
+                {p}
+              </button>
+            ))}
+          </div>
+          {/* Légende */}
+          <div style={{display:"flex",gap:4,alignItems:"center",marginBottom:8}}>
+            <span style={{width:16,height:3,background:ad.diff>=0?T.c2:T.red,borderRadius:2,display:"inline-block"}}/>
+            <span style={{fontSize:10,color:T.textSec}}>Prix de la part (€) — données simulées</span>
+          </div>
+          {/* Graphique mono-ligne */}
+          <ActionChart vals={ad.vals} labels={ad.labels} T={T} positive={ad.diff>=0}/>
+          {/* Badge réel/simulé + bouton import */}
+          <div style={{marginTop:10,padding:"10px 12px",background:T.formBg,borderRadius:10,border:"1px solid "+T.cardBdr}}>
+            {ad.real?(
+              <div style={{fontSize:11,color:T.green,marginBottom:6,fontWeight:600}}>
+                ✅ Données réelles — {navHistory.length} valeurs liquidatives importées
+              </div>
+            ):(
+              <div style={{fontSize:11,color:"#F59E0B",marginBottom:6,fontWeight:600}}>
+                ⚠️ Données simulées — importez le fichier Amundi pour les vraies VL
+              </div>
+            )}
+            <div style={{fontSize:11,color:T.textSec,marginBottom:8}}>
+              Sur <a href="https://funds.amundi-ee.com/fr-FR/QS0009098367" target="_blank"
+                style={{color:T.c1}}>funds.amundi-ee.com</a> → onglet "Historique des prix" → bouton "Exporter" → importez le fichier ici :
+            </div>
+            <label style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,
+              padding:"8px 0",background:T.btnBg,color:T.btnTxt,borderRadius:9,
+              fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {navImporting?"⏳ Lecture...":"📥 Importer fichier Amundi (.xlsx)"}
+              <input type="file" accept=".xlsx,.xls" onChange={importAmundiXLSX} style={{display:"none"}} disabled={navImporting}/>
+            </label>
+            {navMsg&&<div style={{fontSize:11,marginTop:6,color:navMsg.startsWith("✓")?T.green:T.red,textAlign:"center"}}>{navMsg}</div>}
+          </div>
+        </>)}
+      </Card>
+
+      {/* ════ RÉSUMÉ ════ */}
+      <Card>
+        <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:11}}>Résumé</div>
+        {[
+          ["Total parts détenues", fmt(totalParts,5),   T.text],
+          ["Prix moyen d'achat",   fmtE(prixMoyen,4),   T.text],
+          ["Prix actuel",          fmtE(prix,4),         T.text],
+          ["Valeur actuelle",      fmtE(valeur),         T.text],
+          ["Cash investi total",   fmtE(totalCash),      T.text],
+          ["Gain / Perte",         sgn(gain)+fmtE(gain), gainColor],
+          ["Performance",          sgn(perf)+fmt(perf,2)+" %", gainColor],
+        ].map(([k,v,c],i)=>(
+          <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",
+            borderBottom:i<6?"0.5px solid "+T.divider:"none",fontSize:13}}>
+            <span style={{color:T.textSec}}>{k}</span>
+            <span style={{fontWeight:600,color:c}}>{v}</span>
+          </div>
+        ))}
+      </Card>
+
+      {/* ════ TRANSACTIONS ════ */}
+      <Card>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={{fontSize:14,fontWeight:700,color:T.text}}>Transactions</div>
+          <button onClick={()=>setShowForm(!showForm)}
+            style={{fontSize:13,color:T.btnBg,background:"none",border:"none",cursor:"pointer",fontWeight:700}}>
+            {showForm?"✕ Fermer":"+ Ajouter"}
+          </button>
+        </div>
+
+        {showForm&&<AddForm T={T} onCancel={()=>setShowForm(false)} onSave={addTxn}/>}
+
+        {txns.length===0&&(
+          <div style={{textAlign:"center",color:T.textTer,fontSize:13,padding:20}}>Aucune transaction</div>
+        )}
+
+        {(()=>{
+          let cp=0,cc=0;
+          return txns.map((t,i)=>{
+            cp+=t.parts; cc+=t.montant;
+            const g=cp*prix-cc;
+            const pf=cc>0?g/cc*100:0;
+            const gc=g>=0?T.green:T.red;
+            const dl=new Date(t.date).toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit",year:"numeric"});
+            return(
+              <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                padding:"11px 0",borderBottom:i<txns.length-1?"0.5px solid "+T.divider:"none"}}>
+                <div>
+                  <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:3}}>
+                    <span style={{fontSize:11,color:T.textSec}}>{dl}</span>
+                    <span style={{background:T.badgeBg,color:T.badgeTxt,borderRadius:5,
+                      padding:"1px 7px",fontSize:10,fontWeight:700}}>Achat</span>
+                  </div>
+                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{fmtE(t.montant)}</div>
+                  <div style={{fontSize:11,color:T.textSec}}>{fmt(t.parts,5)} parts · {fmtE(t.prix,4)}/part</div>
+                </div>
+                <div style={{textAlign:"right",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+                  <div style={{fontSize:14,fontWeight:700,color:gc}}>{sgn(g)}{fmtE(g)}</div>
+                  <div style={{fontSize:11,color:gc}}>{sgn(pf)}{fmt(pf,2)} %</div>
+                  <button onClick={()=>delTxn(t.id)}
+                    style={{background:"none",border:"none",cursor:"pointer",fontSize:17,lineHeight:1,color:T.textTer}}>
+                    🗑
+                  </button>
+                </div>
+              </div>
+            );
+          });
+        })()}
+      </Card>
+
+      {/* ════ EXPORT / IMPORT ════ */}
+      <Card mb={20}>
+        <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:12}}>Sauvegarde des données</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <button onClick={exportData}
+            style={{flex:1,padding:"10px 0",background:T.btnBg,color:T.btnTxt,border:"none",
+              borderRadius:10,fontSize:13,fontWeight:600,cursor:"pointer",minWidth:120}}>
+            ⬇️ Exporter (JSON)
+          </button>
+          <label style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",
+            padding:"10px 0",background:"transparent",color:T.btnBg,
+            border:"1px solid "+T.btnBg,borderRadius:10,fontSize:13,fontWeight:600,cursor:"pointer",minWidth:120}}>
+            ⬆️ Importer (JSON)
+            <input type="file" accept=".json" onChange={importData} style={{display:"none"}}/>
+          </label>
+        </div>
+        <div style={{fontSize:11,color:T.textTer,marginTop:8,textAlign:"center"}}>
+          Exportez régulièrement pour sauvegarder dans iCloud Drive
+        </div>
+        {navHistory.length>0&&(
+          <div style={{fontSize:11,color:T.green,marginTop:6,textAlign:"center"}}>
+            📊 {navHistory.length} valeurs liquidatives Amundi en mémoire ({navHistory[0]?.date} → {navHistory[navHistory.length-1]?.date})
+          </div>
+        )}
+      </Card>
+
+      <div style={{textAlign:"center",fontSize:11,color:T.lockTxt,paddingBottom:20}}>
+        🔒 Données stockées localement sur votre appareil · Aucun serveur externe
+      </div>
+    </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
